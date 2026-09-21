@@ -109,6 +109,19 @@ those contents immutable for the Reader's lifetime: do not modify a slice
 passed to `OpenBytes` or rewrite or truncate a memory-mapped file in place.
 Open and verify a new Reader when publishing an updated database.
 
+`Open` and `OpenBytes` are intentionally lazy: they decode metadata and
+locate the search tree and data sections, but they do not walk the tree or
+decode records. A database with a corrupt search tree, separator, or data
+record can therefore open successfully and only fail later, when `Lookup`,
+`Decode`, `DecodePath`, or `Networks` reaches the damaged region. `Verify`
+is the eager counterpart: it traverses the entire tree and every referenced
+data record, so it rejects those databases before any query. The trade-off is
+the full-file cost of verification (linear in the number of tree nodes and
+data records, with independent per-record decode limits) versus the constant
+metadata-only cost of opening. Open untrusted databases, call `Verify`
+once, and only then serve queries; continue to treat errors from individual
+lookups or decodes as structural failures even after a successful open.
+
 Reflection decoding limits each operation to 32,768 declared container child
 slots; map keys and values each consume one slot. Maps and slices reserve their
 children before allocation or traversal. Materialized string and byte payloads

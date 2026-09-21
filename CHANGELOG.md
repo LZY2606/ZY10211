@@ -1,5 +1,23 @@
 # Changes
 
+## Unreleased
+
+- Added differential tests that pin the boundary between eager validation and
+  lazy decoding. Starting from a structurally valid minimal MMDB assembled in
+  the test package, semantic mutations (node count, record size, metadata
+  marker, search-tree records, data-section separator, map/array lengths,
+  shared data pointers, pointer rings/fan-out, truncated varints, UTF-8
+  payloads, and the IPv4 start node) are each run through `Open`, `Verify`,
+  `Lookup` plus `Decode`/`DecodePath`, and a capped `Networks` traversal.
+  The tests record cases where lazy `Open` succeeds but `Verify` rejects, and
+  assert every successful decode stays inside the declared data section and
+  the documented payload/container budgets. They also lock the equivalence
+  property that, on a valid database, a `DecodePath` leaf equals the same
+  value reached after a full `Decode`, while on a corrupted database paths
+  may fail at different times but can never return out-of-bounds data. A
+  directed fuzz target with structured mutation seeds is included. These are
+  test-only changes; public behavior and supported platforms are unchanged.
+
 ## 2.7.0
 
 - Go 1.26 or later is now required. CI now tests Go 1.26 and 1.27.
