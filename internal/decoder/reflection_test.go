@@ -1,0 +1,748 @@
+package decoder
+
+import (
+	"encoding/hex"
+	"math/big"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"unsafe"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestBool(t *testing.T) {
+	bools := map[string]any{
+		"0007": false,
+		"0107": true,
+	}
+
+	validateDecoding(t, bools)
+}
+
+func TestDouble(t *testing.T) {
+	doubles := map[string]any{
+		"680000000000000000": 0.0,
+		"683FE0000000000000": 0.5,
+		"68400921FB54442EEA": 3.14159265359,
+		"68405EC00000000000": 123.0,
+		"6841D000000007F8F4": 1073741824.12457,
+		"68BFE0000000000000": -0.5,
+		"68C00921FB54442EEA": -3.14159265359,
+		"68C1D000000007F8F4": -1073741824.12457,
+	}
+	validateDecoding(t, doubles)
+}
+
+func TestFloat(t *testing.T) {
+	floats := map[string]any{
+		"040800000000": float32(0.0),
+		"04083F800000": float32(1.0),
+		"04083F8CCCCD": float32(1.1),
+		"04084048F5C3": float32(3.14),
+		"0408461C3FF6": float32(9999.99),
+		"0408BF800000": float32(-1.0),
+		"0408BF8CCCCD": float32(-1.1),
+		"0408C048F5C3": -float32(3.14),
+		"0408C61C3FF6": float32(-9999.99),
+	}
+	validateDecoding(t, floats)
+}
+
+func TestInt32(t *testing.T) {
+	int32s := map[string]any{
+		"0001":         int32(0),
+		"0401ffffffff": int32(-1),
+		"0101ff":       int32(255),
+		"0401ffffff01": int32(-255),
+		"020101f4":     int32(500),
+		"0401fffffe0c": int32(-500),
+		"0201ffff":     int32(65535),
+		"0401ffff0001": int32(-65535),
+		"0301ffffff":   int32(16777215),
+		"0401ff000001": int32(-16777215),
+		"04017fffffff": int32(2147483647),
+		"040180000001": int32(-2147483647),
+	}
+	validateDecoding(t, int32s)
+}
+
+func TestNegativeInt32DoesNotDecodeIntoUint(t *testing.T) {
+	inputBytes, err := hex.DecodeString("0401ffffffff")
+	require.NoError(t, err)
+
+	d := New(inputBytes)
+
+	var result uint64
+	err = d.Decode(0, &result)
+	require.Error(t, err)
+	assert.Equal(t, uint64(0), result)
+	assert.Contains(t, err.Error(), "cannot unmarshal -1 (int32) into type uint64")
+}
+
+// TestReflectUintOverflowFallback exercises the platform-width guard in
+// tryFastDecodeTyped's reflect.Uint case: when the DB encodes a uint64
+// value that does not fit in the platform's uint, the fast path must
+// return false so the slow path can decide (succeed on 64-bit; report an
+// overflow error on 32-bit). The fast path silently truncating would
+// regress callers that rely on the slow path's overflow check.
+func TestReflectUintOverflowFallback(t *testing.T) {
+	type record struct {
+		N uint `maxminddb:"n"`
+	}
+
+	// Map {n: 0x1_0000_0000} — 33-bit value, fits in uint64 but overflows uint32.
+	data := []byte{
+		0xe1,      // map size 1
+		0x41, 'n', // key "n"
+		0x05, 0x02, // ctrl: extended, size=5; kind = uint64
+		0x01, 0x00, 0x00, 0x00, 0x00, // big-endian 0x100000000
+	}
+
+	d := New(data)
+	var result record
+	err := d.Decode(0, &result)
+
+	const want uint64 = 1 << 32
+	if unsafe.Sizeof(uint(0)) >= 8 {
+		require.NoError(t, err)
+		require.Equal(t, want, uint64(result.N))
+	} else {
+		require.Error(t, err, "32-bit platforms must surface the overflow")
+		require.ErrorContains(t, err, "cannot unmarshal")
+	}
+}
+
+// TestReflectUintFromMultipleSourceKinds covers the three KindUint*
+// cases that tryFastDecodeTyped's reflect.Uint branch accepts for a
+// plain `uint` field. KindUint64 is already exercised by the overflow
+// test above; this fills in KindUint16 and KindUint32 so a copy-paste
+// error (wrong decoder, shift, or SetUint conversion) in either branch
+// would surface.
+func TestReflectUintFromMultipleSourceKinds(t *testing.T) {
+	type record struct {
+		N uint `maxminddb:"n"`
+	}
+
+	cases := []struct {
+		name string
+		data []byte
+		want uint
+	}{
+		{
+			name: "KindUint16",
+			data: []byte{0xe1, 0x41, 'n', 0xa1, 0x2a}, // map{n: uint16(42)}
+			want: 42,
+		},
+		{
+			name: "KindUint32",
+			data: []byte{0xe1, 0x41, 'n', 0xc1, 0x2a}, // map{n: uint32(42)}
+			want: 42,
+		},
+		{
+			name: "KindUint64",
+			data: []byte{0xe1, 0x41, 'n', 0x01, 0x02, 0x2a}, // map{n: uint64(42)}
+			want: 42,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := New(tc.data)
+			var result record
+			require.NoError(t, d.Decode(0, &result))
+			require.Equal(t, tc.want, result.N)
+		})
+	}
+}
+
+func TestFastDecodePointerFieldDoesNotAllocateOnTypeError(t *testing.T) {
+	inputBytes, err := hex.DecodeString("e14173c101")
+	require.NoError(t, err)
+
+	d := New(inputBytes)
+
+	var result struct {
+		S *string `maxminddb:"s"`
+	}
+	err = d.Decode(0, &result)
+	require.Error(t, err)
+	assert.Nil(t, result.S)
+	assert.Contains(t, err.Error(), "cannot unmarshal 1 (uint64) into type string")
+}
+
+func TestDecodeAllocatesTopLevelPointerTarget(t *testing.T) {
+	inputBytes, err := hex.DecodeString("43466f6f")
+	require.NoError(t, err)
+
+	d := New(inputBytes)
+
+	var result *string
+	err = d.Decode(0, &result)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, "Foo", *result)
+}
+
+func TestDecodeDynamicScalar(t *testing.T) {
+	t.Run("database pointer", func(t *testing.T) {
+		d := New([]byte{
+			0x20, 0x02, // pointer to offset 2
+			0xc1, 0x2a, // uint32(42)
+		})
+
+		var result any
+		require.NoError(t, d.Decode(0, &result))
+		assert.Equal(t, uint64(42), result)
+	})
+
+	t.Run("existing interface pointer", func(t *testing.T) {
+		d := New([]byte{0xc1, 0x2a})
+		value := uint32(0)
+		result := any(&value)
+
+		require.NoError(t, d.Decode(0, &result))
+		assert.Same(t, &value, result)
+		assert.Equal(t, uint32(42), value)
+	})
+}
+
+func TestIsEmptyValueAtFollowsPointers(t *testing.T) {
+	d := New([]byte{
+		0x20, 0x02, // pointer to offset 2
+		0xe0, // empty map
+	})
+
+	empty, err := d.IsEmptyValueAt(0)
+	require.NoError(t, err)
+	require.True(t, empty)
+}
+
+func TestIsEmptyValueAtRejectsPointerToPointer(t *testing.T) {
+	d := New([]byte{
+		0x20, 0x00, // pointer to offset 0
+	})
+
+	empty, err := d.IsEmptyValueAt(0)
+	require.Error(t, err)
+	require.False(t, empty)
+	require.ErrorContains(t, err, "invalid pointer to pointer")
+}
+
+func TestDecodeRejectsOversizedContainersBeforeAllocation(t *testing.T) {
+	invalidMapKeys := make([]byte, 0, 3+512*3)
+	invalidMapKeys = append(invalidMapKeys, 0xfe, 0x00, 0xe3) // map with 512 entries
+	for range 512 {
+		invalidMapKeys = append(invalidMapKeys,
+			0x00, 0x07, // false boolean key
+			0xe0, // empty map value
+		)
+	}
+
+	invalidFloatSizes := make([]byte, 0, 4+1024)
+	invalidFloatSizes = append(invalidFloatSizes, 0x1e, 0x04, 0x02, 0xe3) // slice with 1024 entries
+	for range 1024 {
+		invalidFloatSizes = append(invalidFloatSizes, 0x60) // float64 with size 0
+	}
+
+	invalidPointerTarget := make([]byte, 0, 4+5+1023)
+	invalidPointerTarget = append(invalidPointerTarget,
+		0x1e, 0x04, 0x02, 0xe3, // slice with 1024 entries
+		0x38, 0xff, 0xff, 0xff, 0xff, // pointer outside the buffer
+	)
+	for range 1023 {
+		invalidPointerTarget = append(invalidPointerTarget, 0xe0)
+	}
+
+	tests := []struct {
+		name        string
+		data        []byte
+		out         any
+		expectedErr string
+	}{
+		{
+			name:        "impossible map size",
+			data:        []byte{0xff, 0xff, 0xff, 0xff},
+			out:         new(map[string]any),
+			expectedErr: "maximum decoded record size",
+		},
+		{
+			name:        "impossible slice size",
+			data:        []byte{0x1f, 0x04, 0xff, 0xff, 0xff},
+			out:         new([]any),
+			expectedErr: "maximum decoded record size",
+		},
+		{
+			name:        "invalid map key types",
+			data:        invalidMapKeys,
+			out:         new(map[string]any),
+			expectedErr: "unexpected map key type",
+		},
+		{
+			name:        "invalid scalar sizes",
+			data:        invalidFloatSizes,
+			out:         new([]any),
+			expectedErr: "invalid Float64 size",
+		},
+		{
+			name:        "invalid pointer target",
+			data:        invalidPointerTarget,
+			out:         new([]any),
+			expectedErr: "unexpected end of database",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := NewWithoutStringCache(tt.data)
+			err := d.Decode(0, tt.out)
+			require.ErrorContains(t, err, tt.expectedErr)
+
+			value := reflect.ValueOf(tt.out).Elem()
+			require.True(t, value.IsNil(), "destination should not be allocated on invalid input")
+		})
+	}
+}
+
+func TestMap(t *testing.T) {
+	maps := map[string]any{
+		"e0":                             map[string]any{},
+		"e142656e43466f6f":               map[string]any{"en": "Foo"},
+		"e242656e43466f6f427a6843e4baba": map[string]any{"en": "Foo", "zh": "人"},
+		"e1446e616d65e242656e43466f6f427a6843e4baba": map[string]any{
+			"name": map[string]any{"en": "Foo", "zh": "人"},
+		},
+		"e1496c616e677561676573020442656e427a68": map[string]any{
+			"languages": []any{"en", "zh"},
+		},
+	}
+	validateDecoding(t, maps)
+}
+
+func TestEmptyStructRejectsInvalidMapKey(t *testing.T) {
+	d := New([]byte{
+		0xE1, // map with one entry
+		0xA0, // uint16 key
+		0xA0, // uint16 value
+	})
+
+	var result struct{}
+	require.ErrorContains(t, d.Decode(0, &result), "unexpected map key type: Uint16")
+}
+
+func TestDecodeStructFieldFingerprintCollisions(t *testing.T) {
+	type resultType struct {
+		First  string `maxminddb:"abXXyz"`
+		Second string `maxminddb:"abYYyz"`
+	}
+
+	firstKey := []byte("abXXyz")
+	secondKey := []byte("abYYyz")
+	unknownKey := []byte("abZZyz")
+	require.Equal(t, fieldKeyFingerprint(firstKey), fieldKeyFingerprint(secondKey))
+	require.Equal(t, fieldKeyFingerprint(firstKey), fieldKeyFingerprint(unknownKey))
+
+	capacity := 1 + 6 + len(firstKey) + len(secondKey) + len(unknownKey) +
+		len("one") + len("two") + len("ignored")
+	data := make([]byte, 1, capacity)
+	data[0] = 0xe3 // map with three entries
+	data = append(data, 0x46)
+	data = append(data, firstKey...)
+	data = append(data, 0x43, 'o', 'n', 'e')
+	data = append(data, 0x46)
+	data = append(data, secondKey...)
+	data = append(data, 0x43, 't', 'w', 'o')
+	data = append(data, 0x46)
+	data = append(data, unknownKey...)
+	data = append(data, 0x47, 'i', 'g', 'n', 'o', 'r', 'e', 'd')
+
+	var result resultType
+	d := NewWithoutStringCache(data)
+	require.NoError(t, d.Decode(0, &result))
+	require.Equal(t, resultType{First: "one", Second: "two"}, result)
+}
+
+func TestSlice(t *testing.T) {
+	slice := map[string]any{
+		"0004":                 []any{},
+		"010443466f6f":         []any{"Foo"},
+		"020443466f6f43e4baba": []any{"Foo", "人"},
+	}
+	validateDecoding(t, slice)
+}
+
+func TestDecodeSliceClearsReusedElements(t *testing.T) {
+	type item struct {
+		Name  string `maxminddb:"name"`
+		Extra string `maxminddb:"extra"`
+	}
+	type record struct {
+		Items []item `maxminddb:"items"`
+	}
+
+	firstData := []byte{
+		0xe1,
+		0x45, 'i', 't', 'e', 'm', 's',
+		0x01, 0x04,
+		0xe2,
+		0x44, 'n', 'a', 'm', 'e',
+		0x43, 'o', 'l', 'd',
+		0x45, 'e', 'x', 't', 'r', 'a',
+		0x45, 's', 't', 'a', 'l', 'e',
+	}
+	secondData := []byte{
+		0xe1,
+		0x45, 'i', 't', 'e', 'm', 's',
+		0x01, 0x04,
+		0xe1,
+		0x44, 'n', 'a', 'm', 'e',
+		0x43, 'n', 'e', 'w',
+	}
+
+	var result record
+	firstDecoder := New(firstData)
+	require.NoError(t, firstDecoder.Decode(0, &result))
+	require.Equal(t, []item{{Name: "old", Extra: "stale"}}, result.Items)
+
+	secondDecoder := New(secondData)
+	require.NoError(t, secondDecoder.Decode(0, &result))
+	require.Equal(t, []item{{Name: "new"}}, result.Items)
+}
+
+// TestDecodeSliceClearsTailReferences exercises the second Clear in
+// decodeSlice (the tail clear when the new slice is shorter than the
+// previous one). When the element type holds reference fields like maps,
+// failing to clear the tail would leak those references via the reused
+// backing array, defeating the GC.
+func TestDecodeSliceClearsTailReferences(t *testing.T) {
+	type item struct {
+		Name string            `maxminddb:"name"`
+		Tags map[string]string `maxminddb:"tags"`
+	}
+	type record struct {
+		Items []item `maxminddb:"items"`
+	}
+
+	// Two elements, each carrying a tags map.
+	firstData := []byte{
+		0xe1,
+		0x45, 'i', 't', 'e', 'm', 's',
+		0x02, 0x04,
+		0xe2,
+		0x44, 'n', 'a', 'm', 'e',
+		0x43, 'o', 'n', 'e',
+		0x44, 't', 'a', 'g', 's',
+		0xe1,
+		0x41, 'a', 0x41, 'b',
+		0xe2,
+		0x44, 'n', 'a', 'm', 'e',
+		0x43, 't', 'w', 'o',
+		0x44, 't', 'a', 'g', 's',
+		0xe1,
+		0x41, 'c', 0x41, 'd',
+	}
+	// One element, no tags.
+	secondData := []byte{
+		0xe1,
+		0x45, 'i', 't', 'e', 'm', 's',
+		0x01, 0x04,
+		0xe1,
+		0x44, 'n', 'a', 'm', 'e',
+		0x43, 'n', 'e', 'w',
+	}
+
+	var result record
+	firstDecoder := New(firstData)
+	require.NoError(t, firstDecoder.Decode(0, &result))
+	require.Len(t, result.Items, 2)
+	require.Equal(t, map[string]string{"a": "b"}, result.Items[0].Tags)
+	require.Equal(t, map[string]string{"c": "d"}, result.Items[1].Tags)
+
+	capBefore := cap(result.Items)
+	require.GreaterOrEqual(t, capBefore, 2,
+		"setup requires cap >= 2 so the second decode reuses the backing array")
+
+	secondDecoder := New(secondData)
+	require.NoError(t, secondDecoder.Decode(0, &result))
+	require.Equal(t, []item{{Name: "new"}}, result.Items)
+
+	full := result.Items[:capBefore]
+	require.Nil(t, full[1].Tags,
+		"hidden tail element's map reference must be cleared (GC)")
+	require.Empty(t, full[1].Name,
+		"hidden tail element's string field must be cleared")
+}
+
+// TestDecodeSliceClearsTailPointers is the pointer-element analog of
+// TestDecodeSliceClearsTailReferences. For []*T the slice element IS the
+// GC root, so the tail-clear path at reflection.go:797-813 is what makes
+// the previously-held element reclaimable. A regression that only cleared
+// [0:sliceLen] would leave the *T at the hidden index pointing at the
+// old object — invisible to a value-element test but caught here.
+func TestDecodeSliceClearsTailPointers(t *testing.T) {
+	type item struct {
+		Name string `maxminddb:"name"`
+	}
+	type record struct {
+		Items []*item `maxminddb:"items"`
+	}
+
+	// Two-element slice: [{Name:"one"}, {Name:"two"}].
+	firstData := []byte{
+		0xe1,
+		0x45, 'i', 't', 'e', 'm', 's',
+		0x02, 0x04,
+		0xe1,
+		0x44, 'n', 'a', 'm', 'e',
+		0x43, 'o', 'n', 'e',
+		0xe1,
+		0x44, 'n', 'a', 'm', 'e',
+		0x43, 't', 'w', 'o',
+	}
+	// One-element slice: [{Name:"new"}].
+	secondData := []byte{
+		0xe1,
+		0x45, 'i', 't', 'e', 'm', 's',
+		0x01, 0x04,
+		0xe1,
+		0x44, 'n', 'a', 'm', 'e',
+		0x43, 'n', 'e', 'w',
+	}
+
+	var result record
+	firstDecoder := New(firstData)
+	require.NoError(t, firstDecoder.Decode(0, &result))
+	require.Len(t, result.Items, 2)
+	require.NotNil(t, result.Items[0])
+	require.NotNil(t, result.Items[1])
+	require.Equal(t, "one", result.Items[0].Name)
+	require.Equal(t, "two", result.Items[1].Name)
+
+	capBefore := cap(result.Items)
+	require.GreaterOrEqual(t, capBefore, 2,
+		"setup requires cap >= 2 so the second decode reuses the backing array")
+
+	secondDecoder := New(secondData)
+	require.NoError(t, secondDecoder.Decode(0, &result))
+	require.Len(t, result.Items, 1)
+	require.NotNil(t, result.Items[0])
+	require.Equal(t, "new", result.Items[0].Name)
+
+	full := result.Items[:capBefore]
+	require.Nil(t, full[1],
+		"hidden tail's *item pointer must be cleared so the previously-held element is GC-eligible")
+}
+
+// TestDecodeSliceReusesBackingArray confirms the perf invariant of the
+// reuse path: a second decode into the same destination must reuse the
+// existing backing array rather than allocate fresh. The sibling
+// TestDecodeSliceClears* tests cover the safety properties of reuse;
+// this test guards against a regression that would silently allocate.
+func TestDecodeSliceReusesBackingArray(t *testing.T) {
+	type record struct {
+		Items []string `maxminddb:"items"`
+	}
+
+	// Map {items: ["aa", "bb", "cc"]}
+	data := []byte{
+		0xe1,
+		0x45, 'i', 't', 'e', 'm', 's',
+		0x03, 0x04,
+		0x42, 'a', 'a',
+		0x42, 'b', 'b',
+		0x42, 'c', 'c',
+	}
+
+	var result record
+	first := New(data)
+	require.NoError(t, first.Decode(0, &result))
+	require.Equal(t, []string{"aa", "bb", "cc"}, result.Items)
+
+	//nolint:gosec // test only
+	firstData := unsafe.SliceData(result.Items)
+	firstCap := cap(result.Items)
+
+	second := New(data)
+	require.NoError(t, second.Decode(0, &result))
+	require.Equal(t, []string{"aa", "bb", "cc"}, result.Items)
+	require.Equal(t, firstCap, cap(result.Items),
+		"capacity should not change on identical second decode")
+	require.Same(t, firstData,
+		//nolint:gosec // test only
+		unsafe.SliceData(result.Items),
+		"second decode must reuse the existing backing array")
+}
+
+var testStrings = makeTestStrings()
+
+func makeTestStrings() map[string]any {
+	str := map[string]any{
+		"40":       "",
+		"4131":     "1",
+		"43E4BABA": "人",
+		"5b313233343536373839303132333435363738393031323334353637":         "123456789012345678901234567",
+		"5c31323334353637383930313233343536373839303132333435363738":       "1234567890123456789012345678",
+		"5d003132333435363738393031323334353637383930313233343536373839":   "12345678901234567890123456789",
+		"5d01313233343536373839303132333435363738393031323334353637383930": "123456789012345678901234567890",
+	}
+
+	for k, v := range map[string]int{"5e00d7": 500, "5e06b3": 2000, "5f001053": 70000} {
+		key := k + strings.Repeat("78", v)
+		str[key] = strings.Repeat("x", v)
+	}
+
+	return str
+}
+
+func TestString(t *testing.T) {
+	validateDecoding(t, testStrings)
+}
+
+func TestByte(t *testing.T) {
+	b := make(map[string]any)
+	for key, val := range testStrings {
+		oldCtrl, err := hex.DecodeString(key[0:2])
+		require.NoError(t, err)
+		newCtrl := []byte{oldCtrl[0] ^ 0xc0}
+		key = strings.Replace(key, hex.EncodeToString(oldCtrl), hex.EncodeToString(newCtrl), 1)
+		b[key] = []byte(val.(string))
+	}
+
+	validateDecoding(t, b)
+}
+
+func TestUint16(t *testing.T) {
+	uint16s := map[string]any{
+		"a0":     uint64(0),
+		"a1ff":   uint64(255),
+		"a201f4": uint64(500),
+		"a22a78": uint64(10872),
+		"a2ffff": uint64(65535),
+	}
+	validateDecoding(t, uint16s)
+}
+
+func TestUint32(t *testing.T) {
+	uint32s := map[string]any{
+		"c0":         uint64(0),
+		"c1ff":       uint64(255),
+		"c201f4":     uint64(500),
+		"c22a78":     uint64(10872),
+		"c2ffff":     uint64(65535),
+		"c3ffffff":   uint64(16777215),
+		"c4ffffffff": uint64(4294967295),
+	}
+	validateDecoding(t, uint32s)
+}
+
+func TestUint64(t *testing.T) {
+	ctrlByte := "02"
+	bits := uint64(64)
+
+	uints := map[string]any{
+		"00" + ctrlByte:          uint64(0),
+		"02" + ctrlByte + "01f4": uint64(500),
+		"02" + ctrlByte + "2a78": uint64(10872),
+	}
+	for i := uint64(0); i <= bits/8; i++ {
+		expected := uint64((1 << (8 * i)) - 1)
+
+		input := hex.EncodeToString([]byte{byte(i)}) + ctrlByte + strings.Repeat("ff", int(i))
+		uints[input] = expected
+	}
+
+	validateDecoding(t, uints)
+}
+
+// Dedup with above somehow.
+func TestUint128(t *testing.T) {
+	ctrlByte := "03"
+	bits := uint(128)
+
+	uints := map[string]any{
+		"00" + ctrlByte:          big.NewInt(0),
+		"02" + ctrlByte + "01f4": big.NewInt(500),
+		"02" + ctrlByte + "2a78": big.NewInt(10872),
+	}
+	for i := uint(1); i <= bits/8; i++ {
+		expected := powBigInt(big.NewInt(2), 8*i)
+		expected = expected.Sub(expected, big.NewInt(1))
+		input := hex.EncodeToString([]byte{byte(i)}) + ctrlByte + strings.Repeat("ff", int(i))
+
+		uints[input] = expected
+	}
+
+	validateDecoding(t, uints)
+}
+
+// No pow or bit shifting for big int, apparently :-(
+// This is _not_ meant to be a comprehensive power function.
+func powBigInt(bi *big.Int, pow uint) *big.Int {
+	newInt := big.NewInt(1)
+	for range pow {
+		newInt.Mul(newInt, bi)
+	}
+	return newInt
+}
+
+func validateDecoding(t *testing.T, tests map[string]any) {
+	for inputStr, expected := range tests {
+		inputBytes, err := hex.DecodeString(inputStr)
+		require.NoError(t, err)
+		d := New(inputBytes)
+
+		var result any
+		_, err = d.decode(0, reflect.ValueOf(&result))
+		require.NoError(t, err)
+
+		if !reflect.DeepEqual(result, expected) {
+			// A big case statement would produce nicer errors
+			t.Errorf("Output was incorrect: %s  %s", inputStr, expected)
+		}
+	}
+}
+
+func TestPointers(t *testing.T) {
+	bytes, err := os.ReadFile(testFile("maps-with-pointers.raw"))
+	require.NoError(t, err)
+	d := New(bytes)
+
+	expected := map[uint]map[string]string{
+		0:  {"long_key": "long_value1"},
+		22: {"long_key": "long_value2"},
+		37: {"long_key2": "long_value1"},
+		50: {"long_key2": "long_value2"},
+		55: {"long_key": "long_value1"},
+		57: {"long_key2": "long_value2"},
+	}
+
+	for offset, expectedValue := range expected {
+		var actual map[string]string
+		_, err := d.decode(offset, reflect.ValueOf(&actual))
+		require.NoError(t, err)
+		if !reflect.DeepEqual(actual, expectedValue) {
+			t.Errorf("Decode for pointer at %d failed", offset)
+		}
+	}
+}
+
+func TestOversizedPointerReturnsError(t *testing.T) {
+	d := New([]byte{
+		0x38,                   // pointer with 4-byte payload
+		0xff, 0xff, 0xff, 0xff, // offset math overflows int on 32-bit
+	})
+
+	var result any
+	var err error
+	require.NotPanics(t, func() {
+		err = d.Decode(0, &result)
+	})
+	require.ErrorContains(t, err, "unexpected end of database")
+}
+
+func testFile(file string) string {
+	return filepath.Join("..", "..", "testdata", "test-data", file)
+}
