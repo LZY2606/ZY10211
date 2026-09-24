@@ -127,6 +127,42 @@ must bound their own work; `Reader.Verify` validates the complete data section
 and the original metadata graph, including unknown metadata fields, before
 those APIs are used with untrusted input.
 
+### Corruption Semantics and Differential Testing
+
+The boundary between lazy opening and strict verification is locked by
+structured-mutation differential tests (`differential_mutation_test.go`). The
+tests build a minimal valid database in memory and mutate individual fields
+with semantic awareness — metadata node count and record size, the metadata
+marker, search-tree pointers, the data-section separator, map and array
+length headers, shared data pointers, and UTF-8 payloads — then run every
+mutation through `Open`/`OpenBytes`, `Verify`, `Lookup`+`Decode`,
+`DecodePath`, and a bounded `Networks` walk. The semantics they pin down:
+
+- `Open` is lazy: a database may open successfully and only fail during
+  `Verify`, lookup, or decoding. These cases are expected and recorded by
+  the tests, not treated as contradictions.
+- Every successful decode stays within the declared data section and within
+  the per-operation budget (32,768 container child slots and 2 MiB of
+  materialized payload), so corrupt input cannot cause unbounded time or
+  memory use.
+- For a legal database, a `DecodePath` leaf always equals a full `Decode`
+  followed by walking the same path. For a corrupt database the two paths
+  may fail at different times, but no successful path returns out-of-bounds
+  data while another reports a structural error.
+- If `Verify` succeeds, lookups, decodes, and bounded network iteration do
+  not produce structural errors.
+- One documented value-level divergence exists: in a corrupt database with
+  duplicate map keys, `Decode` into a Go map keeps the last entry while
+  `DecodePath` returns the first match. The verifier currently accepts such
+  databases; both results remain within the data section and decode budget.
+
+Complexity: verification is O(node count + referenced data records), a lookup
+is O(address bits), and decoding is bounded by the budgets above, so each
+mutated fixture runs in bounded time with explicit iteration caps. The tests
+are hermetic — no network, clock, or filesystem-ordering dependencies — and
+change no public behavior or supported platforms; in-memory cases use
+`OpenBytes` with a temp-file `Open` cross-check.
+
 ### Custom Struct Decoding
 
 ```go

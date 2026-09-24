@@ -3,6 +3,12 @@
 ## 2.7.0
 
 - Go 1.26 or later is now required. CI now tests Go 1.26 and 1.27.
+- Added structured-mutation differential tests that build a minimal valid
+  database in memory, mutate individual fields (metadata, tree pointers,
+  separator, container lengths, shared pointers, UTF-8 payloads), and
+  cross-check `Open`, `Verify`, `Lookup`+`Decode`, `DecodePath`, and bounded
+  `Networks` iteration for consistent bounds and budget behavior. No public
+  behavior changed.
 
 ## 2.6.0 - 2026-09-07
 
